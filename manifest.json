@@ -1,0 +1,19 @@
+{
+  "type": "plugin",
+  "id": "com.example.web-clipper",
+  "name": "Web Clipper",
+  "version": "1.0.0",
+  "apiVersion": "2",
+  "settingsUi": "host",
+  "description": "Clip a webpage or an RSS feed entry into a note.",
+  "locales": {
+    "zh-CN": {
+      "name": "网页收藏",
+      "description": "把网页或 RSS 订阅里的文章一键收藏成笔记。"
+    }
+  },
+  "author": "ZhenYu-Jiang",
+  "entry": "./main.js",
+  "platforms": ["web", "desktop"],
+  "permissions": ["network:public", "notes:write", "metadata:read", "ui:commands", "ui:panels", "ui:notices"]
+}
