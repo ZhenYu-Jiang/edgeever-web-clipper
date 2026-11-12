@@ -2,18 +2,18 @@
   "type": "plugin",
   "id": "com.example.web-clipper",
   "name": "Web Clipper",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "apiVersion": "2",
   "settingsUi": "host",
-  "description": "Clip a webpage or an RSS feed entry into a note.",
+  "description": "Extract article content, preview it, and save formatted notes from webpages or RSS feeds.",
   "locales": {
     "zh-CN": {
       "name": "网页收藏",
-      "description": "把网页或 RSS 订阅里的文章一键收藏成笔记。"
+      "description": "提取网页正文，预览后保存为笔记，保留标题、列表、链接与图片；支持 RSS 和手动粘贴。"
     }
   },
   "author": "ZhenYu-Jiang",
   "entry": "./main.js",
   "platforms": ["web", "desktop"],
-  "permissions": ["network:public", "notes:write", "metadata:read", "ui:commands", "ui:panels", "ui:notices"]
+  "permissions": ["network:public", "notes:write", "metadata:read", "ui:commands", "ui:panels", "ui:notices", "ui:navigation"]
 }
