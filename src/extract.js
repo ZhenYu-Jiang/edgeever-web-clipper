@@ -129,6 +129,20 @@ export function noteInput(draft, title, notebookId) {
   };
 }
 
+export function imageUrls(html) {
+  const template = document.createElement('template'); template.innerHTML = html;
+  return [...new Set([...template.content.querySelectorAll('img[src]')].map(image => image.getAttribute('src')))];
+}
+
+export function markdownWithImages(html, replacements) {
+  const template = document.createElement('template'); template.innerHTML = html;
+  for (const image of template.content.querySelectorAll('img[src]')) {
+    const replacement = replacements.get(image.getAttribute('src'));
+    if (replacement) image.setAttribute('src', replacement);
+  }
+  return converter.turndown(template.innerHTML).trim();
+}
+
 export function parseFeed(xml, feedUrl) {
   const doc = new DOMParser().parseFromString(xml, 'text/xml');
   if (doc.querySelector('parsererror')) throw new Error('这不是有效的 RSS/Atom 内容，请检查订阅链接。');

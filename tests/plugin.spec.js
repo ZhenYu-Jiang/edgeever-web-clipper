@@ -15,6 +15,7 @@ test('full article survives extraction and save, including tail and formatted co
   page.on('request', (request) => { if (!request.url().startsWith('http://127.0.0.1:4181')) external.push(request.url()); });
   await page.route('https://**/*', (route) => route.abort());
   await open(page); await extract(page);
+  await page.getByLabel('将图片保存为附件', { exact: false }).uncheck();
   expect(await page.evaluate(() => host.created)).toEqual([]);
   await expect(page.getByLabel('正文预览')).toContainText('文章末尾校验标记');
   await expect(page.getByLabel('正文预览')).not.toContainText('导航广告');

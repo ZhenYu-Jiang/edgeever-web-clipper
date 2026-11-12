@@ -1,5 +1,6 @@
 import { contentFromPlain, extractArticle, fetchText, normalizeUrl, noteInput, parseFeed, previewFragment } from './extract.js';
 import { STYLE } from './styles.js';
+import { saveImages, findExisting } from './images.js';
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -20,7 +21,7 @@ export default {
       mount(container, { shell }) {
         shell.set({ header: { title: '网页收藏', description: '提取正文，确认内容，再存进笔记本' } });
         let mounted = true, requestId = 0, controller = null, busy = false, saving = false;
-        let draft = null, notebooksReady = false, notebookRequest = 0;
+        let draft = null, notebooksReady = false, notebookRequest = 0, imageController = null;
         const root = element('div', 'wc-root');
         root.append(element('style', '', STYLE));
         const urlLabel = element('label', 'wc-label', '网页或 RSS 地址');
@@ -73,11 +74,17 @@ export default {
         const footerHint = element('span', 'wc-hint', '预览不会自动创建笔记');
         const footerActions = element('div', 'wc-row');
         const openSaved = button('打开笔记', async () => {
-          try { await context.ui.openNote(draft.savedId); }
+          try { await context.ui.openNote(draft.savedId || draft.existingId); }
           catch { status('笔记已保存，但暂时无法打开；可以到所选笔记本查找。', true); }
         }); openSaved.hidden = true;
-        const save = button('保存正文', saveDraft, true);
-        footerActions.append(openSaved, save); footer.append(footerHint, footerActions);
+        const save = button('保存正文', () => saveDraft(false), true);
+        const copy = button('仍保存新副本', () => saveDraft(true)); copy.hidden = true;
+        const retryImages = button('重试保存图片', () => finishImages(draft)); retryImages.hidden = true;
+        const stopImages = button('停止下载图片', () => imageController?.abort()); stopImages.hidden = true;
+        const imageOption = element('label', 'wc-hint');
+        const localImages = element('input'); localImages.type = 'checkbox'; localImages.checked = true;
+        imageOption.append(localImages, document.createTextNode(' 将图片保存为附件（最多 20 张，每张 2 MB）'));
+        footerActions.append(openSaved, copy, retryImages, stopImages, save); footer.append(imageOption, footerHint, footerActions);
         root.append(urlLabel, actions, notebookRow, message, content, footer); container.append(root);
         let titleInput = null;
 
@@ -90,9 +97,13 @@ export default {
           extract.disabled = busy || saving; rss.disabled = busy || saving; bookmark.disabled = saving;
           cancel.hidden = !busy; input.disabled = saving; notebooks.disabled = saving || !notebooksReady;
           refresh.disabled = saving; usePasted.disabled = saving;
-          save.disabled = busy || saving || !draft || !notebooksReady || !notebooks.value || Boolean(draft.saved) || draft.kind === 'unavailable';
+          save.disabled = busy || saving || !draft || !notebooksReady || !notebooks.value || Boolean(draft.saved) || Boolean(draft.existingId) || draft.kind === 'unavailable';
           save.textContent = saving ? '保存中…' : draft?.saved ? '已保存' : draft?.kind === 'bookmark' ? '保存链接与摘要' : draft?.kind === 'feed-summary' ? '保存订阅摘要' : '保存正文';
-          openSaved.hidden = !draft?.savedId;
+          openSaved.hidden = !draft?.savedId && !draft?.existingId;
+          openSaved.textContent = draft?.existingId && !draft?.savedId ? '打开已有收藏' : '打开笔记';
+          copy.hidden = !draft?.existingId || Boolean(draft?.saved); copy.disabled = saving;
+          retryImages.hidden = !draft?.savedId || !draft?.imagesPending; retryImages.disabled = saving;
+          stopImages.hidden = !imageController; localImages.disabled = saving || Boolean(draft?.saved);
           footerHint.textContent = draft?.saved ? '已创建笔记，本次预览不会重复保存' : '确认内容后再保存，自动添加「收藏」标签';
           if (titleInput) titleInput.disabled = saving || Boolean(draft?.saved);
         }
@@ -135,7 +146,7 @@ export default {
           preview.append(previewFragment(value.html));
           wrapper.append(titleLabel, info);
           if (value.warning) wrapper.append(element('p', 'wc-hint', value.warning));
-          if (value.images) wrapper.append(element('p', 'wc-hint', '图片保存为原站链接，预览仅显示占位；不包含离线图片副本。'));
+          if (value.images) wrapper.append(element('p', 'wc-hint', '预览不加载远程图片。勾选下方选项后，保存时下载图片为附件；无法下载的图片保留原链接。'));
           if (value.characters) wrapper.append(preview);
           display.append(wrapper); content.scrollTop = 0; sync();
         }
@@ -198,21 +209,40 @@ export default {
           }
         }
 
-        async function saveDraft() {
-          if (save.disabled || !draft || saving) return;
+        async function finishImages(target) {
+          if (!target?.savedId || saving) return;
+          saving = true; const controller = new AbortController(); imageController = controller;
+          const timeout = setTimeout(() => controller.abort(), 60000); sync();
+          try {
+            const result = await saveImages(context, target, target.savedPayload, controller.signal, status);
+            target.imagesPending = result.saved < Math.min(result.total, 20);
+            status(`正文已保存；图片已保存为附件 ${result.saved}/${result.total} 张。${target.imagesPending ? '其余保留原链接，可点击重试。' : result.total > 20 ? '超过 20 张上限的图片保留原链接。' : ''}`, target.imagesPending);
+          } catch(error) { target.imagesPending = true; status(`正文已保存，图片处理未完成：${error.message || error}`, true); }
+          finally { clearTimeout(timeout); imageController = null; saving = false; sync(); }
+        }
+
+        async function saveDraft(forceCopy = false) {
+          if ((!forceCopy && save.disabled) || !draft || saving || draft.saved) return;
           const target = draft;
           const payload = noteInput(target, titleInput.value, notebooks.value);
-          saving = true; sync(); status('正在保存笔记…');
+          saving = true; sync(); status('正在检查重复收藏…');
           try {
+            if (!forceCopy) {
+              const existing = await findExisting(context, target.url);
+              if (!mounted) return;
+              if (existing) { target.existingId = existing.id; status('已收藏过这个网址。可以打开已有收藏，或选择仍保存新副本。'); return; }
+            }
+            status('正在保存笔记…');
             const note = await context.notes.create(payload);
-            target.saved = true; target.savedId = note?.id || null;
+            target.saved = true; target.savedId = note?.id || null; target.savedPayload = payload;
             status('已保存到所选笔记本。');
             context.ui.showNotice('已收藏：' + payload.title);
           } catch { status('保存未完成，预览内容已保留。请检查网络及笔记本；如果连接中断，先确认笔记本中是否已经生成笔记再重试。', true); }
           finally { saving = false; sync(); }
+          if (mounted && target.savedId && target.images && localImages.checked) await finishImages(target);
         }
         sync(); void loadNotebooks();
-        const cleanup = () => { mounted = false; requestId++; controller?.abort(); cleanupPanels.delete(cleanup); root.remove(); };
+        const cleanup = () => { mounted = false; requestId++; controller?.abort(); imageController?.abort(); cleanupPanels.delete(cleanup); root.remove(); };
         cleanupPanels.add(cleanup); return cleanup;
       },
     });

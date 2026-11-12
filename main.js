@@ -5331,6 +5331,20 @@ function noteInput(draft, title, notebookId) {
 ${warning}${draft.markdown}`.trim()
   };
 }
+function imageUrls(html2) {
+  const template = document.createElement("template");
+  template.innerHTML = html2;
+  return [...new Set([...template.content.querySelectorAll("img[src]")].map((image) => image.getAttribute("src")))];
+}
+function markdownWithImages(html2, replacements) {
+  const template = document.createElement("template");
+  template.innerHTML = html2;
+  for (const image of template.content.querySelectorAll("img[src]")) {
+    const replacement = replacements.get(image.getAttribute("src"));
+    if (replacement) image.setAttribute("src", replacement);
+  }
+  return converter.turndown(template.innerHTML).trim();
+}
 function parseFeed(xml2, feedUrl) {
   const doc = new DOMParser().parseFromString(xml2, "text/xml");
   if (doc.querySelector("parsererror")) throw new Error("这不是有效的 RSS/Atom 内容，请检查订阅链接。");
@@ -5431,6 +5445,92 @@ var STYLE = `
 @media (max-width: 420px) { .wc-root { max-height: 82dvh; gap: 9px; } .wc-btn { padding: 8px 10px; } .wc-preview { padding: 12px; } }
 `;
 
+// src/images.js
+var TYPES = { "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp", "image/avif": "avif" };
+function isImage(bytes, type) {
+  const head = String.fromCharCode(...bytes.slice(0, 32));
+  if (type === "image/png") return bytes[0] === 137 && head.slice(1, 4) === "PNG";
+  if (type === "image/jpeg") return bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255;
+  if (type === "image/gif") return /^GIF8[79]a/.test(head);
+  if (type === "image/webp") return head.startsWith("RIFF") && head.slice(8, 12) === "WEBP";
+  return type === "image/avif" && head.slice(4, 8) === "ftyp" && /avif|avis/.test(head.slice(8));
+}
+async function fetchImage(context, address, parentSignal) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  parentSignal.addEventListener("abort", abort, { once: true });
+  const timeout = setTimeout(abort, 15e3);
+  const interrupted = new Promise((_, reject) => controller.signal.addEventListener("abort", () => reject(new Error("下载超时或已停止")), { once: true }));
+  try {
+    parentSignal.throwIfAborted();
+    const download = async () => {
+      let url = normalizeUrl(address);
+      for (let redirect = 0; redirect < 4; redirect++) {
+        controller.signal.throwIfAborted();
+        const response = await context.network.fetch(url, { transport: "public", method: "GET", signal: controller.signal });
+        if ([301, 302, 303, 307, 308].includes(response.status)) {
+          const location = response.headers.get("location");
+          if (!location) throw Error("图片跳转缺少地址");
+          url = normalizeUrl(new URL(location, url).href);
+          continue;
+        }
+        if (!response.ok) throw Error(`HTTP ${response.status}`);
+        const type = (response.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+        if (!TYPES[type]) throw Error("不支持的图片格式");
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        controller.signal.throwIfAborted();
+        if (!bytes.length || bytes.length > MAX_BYTES) throw Error("图片超过 2 MB 或内容为空");
+        if (!isImage(bytes, type)) throw Error("返回内容不是有效图片");
+        return { bytes, type, extension: TYPES[type] };
+      }
+      throw Error("图片跳转次数过多");
+    };
+    return await Promise.race([download(), interrupted]);
+  } finally {
+    clearTimeout(timeout);
+    parentSignal.removeEventListener("abort", abort);
+  }
+}
+async function saveImages(context, target, payload, signal, progress) {
+  const urls = imageUrls(target.html), replacements = target.imageReplacements || (target.imageReplacements = /* @__PURE__ */ new Map());
+  const failed = [];
+  let downloaded = 0;
+  for (const [index, url] of urls.slice(0, 20).entries()) {
+    if (signal.aborted || downloaded >= 2e7) break;
+    if (replacements.has(url)) continue;
+    progress(`正文已保存，正在保存图片 ${index + 1}/${Math.min(urls.length, 20)}…`);
+    try {
+      const image = await fetchImage(context, url, signal);
+      if (signal.aborted) break;
+      downloaded += image.bytes.length;
+      if (downloaded > 2e7) throw Error("本次图片合计超过 20 MB");
+      const resource = await context.resources.upload(target.savedId, new File([image.bytes], `clipper-${index + 1}.${image.extension}`, { type: image.type }));
+      if (!resource?.url || !/^(?:\/(?!\/)|https?:\/\/)/i.test(resource.url)) throw Error("附件地址不可用");
+      replacements.set(url, resource.url);
+    } catch (error) {
+      failed.push({ url, reason: error.message || String(error) });
+    }
+  }
+  let linked = false;
+  if (replacements.size) {
+    const current = await context.notes.get(target.savedId);
+    const expected = target.imageMarkdown || payload.contentMarkdown;
+    if (current.contentMarkdown !== expected) throw Error("笔记已被修改，未覆盖修改；已上传的图片可在笔记附件中找到");
+    const markdown = noteInput({ ...target, markdown: markdownWithImages(target.html, replacements) }, payload.title, payload.notebookId).contentMarkdown;
+    if (markdown !== current.contentMarkdown) {
+      await context.notes.editMarkdown(target.savedId, { expectedRevision: current.revision, expectedContentHash: current.contentHash, edits: [{ from: 0, to: current.contentMarkdown.length, insert: markdown }] });
+    }
+    target.imageMarkdown = markdown;
+    linked = true;
+  }
+  return { saved: linked ? replacements.size : 0, total: urls.length, failed, stopped: signal.aborted };
+}
+async function findExisting(context, url) {
+  const result = await context.notes.queryContent({ text: url, tags: ["收藏"], limit: 50 });
+  const source = `> 来源：<${url}>`;
+  return result.notes.find((note) => note.contentMarkdown?.split(/\r?\n/, 1)[0] === source) || null;
+}
+
 // src/main.js
 function element(tag, className, text3) {
   const node = document.createElement(tag);
@@ -5455,7 +5555,7 @@ var main_default = {
       mount(container, { shell }) {
         shell.set({ header: { title: "网页收藏", description: "提取正文，确认内容，再存进笔记本" } });
         let mounted = true, requestId = 0, controller = null, busy = false, saving = false;
-        let draft = null, notebooksReady = false, notebookRequest = 0;
+        let draft = null, notebooksReady = false, notebookRequest = 0, imageController = null;
         const root2 = element("div", "wc-root");
         root2.append(element("style", "", STYLE));
         const urlLabel = element("label", "wc-label", "网页或 RSS 地址");
@@ -5523,15 +5623,26 @@ var main_default = {
         const footerActions = element("div", "wc-row");
         const openSaved = button("打开笔记", async () => {
           try {
-            await context.ui.openNote(draft.savedId);
+            await context.ui.openNote(draft.savedId || draft.existingId);
           } catch {
             status("笔记已保存，但暂时无法打开；可以到所选笔记本查找。", true);
           }
         });
         openSaved.hidden = true;
-        const save = button("保存正文", saveDraft, true);
-        footerActions.append(openSaved, save);
-        footer.append(footerHint, footerActions);
+        const save = button("保存正文", () => saveDraft(false), true);
+        const copy = button("仍保存新副本", () => saveDraft(true));
+        copy.hidden = true;
+        const retryImages = button("重试保存图片", () => finishImages(draft));
+        retryImages.hidden = true;
+        const stopImages = button("停止下载图片", () => imageController?.abort());
+        stopImages.hidden = true;
+        const imageOption = element("label", "wc-hint");
+        const localImages = element("input");
+        localImages.type = "checkbox";
+        localImages.checked = true;
+        imageOption.append(localImages, document.createTextNode(" 将图片保存为附件（最多 20 张，每张 2 MB）"));
+        footerActions.append(openSaved, copy, retryImages, stopImages, save);
+        footer.append(imageOption, footerHint, footerActions);
         root2.append(urlLabel, actions, notebookRow, message, content, footer);
         container.append(root2);
         let titleInput = null;
@@ -5550,9 +5661,16 @@ var main_default = {
           notebooks.disabled = saving || !notebooksReady;
           refresh.disabled = saving;
           usePasted.disabled = saving;
-          save.disabled = busy || saving || !draft || !notebooksReady || !notebooks.value || Boolean(draft.saved) || draft.kind === "unavailable";
+          save.disabled = busy || saving || !draft || !notebooksReady || !notebooks.value || Boolean(draft.saved) || Boolean(draft.existingId) || draft.kind === "unavailable";
           save.textContent = saving ? "保存中…" : draft?.saved ? "已保存" : draft?.kind === "bookmark" ? "保存链接与摘要" : draft?.kind === "feed-summary" ? "保存订阅摘要" : "保存正文";
-          openSaved.hidden = !draft?.savedId;
+          openSaved.hidden = !draft?.savedId && !draft?.existingId;
+          openSaved.textContent = draft?.existingId && !draft?.savedId ? "打开已有收藏" : "打开笔记";
+          copy.hidden = !draft?.existingId || Boolean(draft?.saved);
+          copy.disabled = saving;
+          retryImages.hidden = !draft?.savedId || !draft?.imagesPending;
+          retryImages.disabled = saving;
+          stopImages.hidden = !imageController;
+          localImages.disabled = saving || Boolean(draft?.saved);
           footerHint.textContent = draft?.saved ? "已创建笔记，本次预览不会重复保存" : "确认内容后再保存，自动添加「收藏」标签";
           if (titleInput) titleInput.disabled = saving || Boolean(draft?.saved);
         }
@@ -5624,7 +5742,7 @@ var main_default = {
           preview.append(previewFragment(value.html));
           wrapper.append(titleLabel, info);
           if (value.warning) wrapper.append(element("p", "wc-hint", value.warning));
-          if (value.images) wrapper.append(element("p", "wc-hint", "图片保存为原站链接，预览仅显示占位；不包含离线图片副本。"));
+          if (value.images) wrapper.append(element("p", "wc-hint", "预览不加载远程图片。勾选下方选项后，保存时下载图片为附件；无法下载的图片保留原链接。"));
           if (value.characters) wrapper.append(preview);
           display.append(wrapper);
           content.scrollTop = 0;
@@ -5710,17 +5828,49 @@ var main_default = {
             display.append(row);
           }
         }
-        async function saveDraft() {
-          if (save.disabled || !draft || saving) return;
+        async function finishImages(target) {
+          if (!target?.savedId || saving) return;
+          saving = true;
+          const controller2 = new AbortController();
+          imageController = controller2;
+          const timeout = setTimeout(() => controller2.abort(), 6e4);
+          sync();
+          try {
+            const result = await saveImages(context, target, target.savedPayload, controller2.signal, status);
+            target.imagesPending = result.saved < Math.min(result.total, 20);
+            status(`正文已保存；图片已保存为附件 ${result.saved}/${result.total} 张。${target.imagesPending ? "其余保留原链接，可点击重试。" : result.total > 20 ? "超过 20 张上限的图片保留原链接。" : ""}`, target.imagesPending);
+          } catch (error) {
+            target.imagesPending = true;
+            status(`正文已保存，图片处理未完成：${error.message || error}`, true);
+          } finally {
+            clearTimeout(timeout);
+            imageController = null;
+            saving = false;
+            sync();
+          }
+        }
+        async function saveDraft(forceCopy = false) {
+          if (!forceCopy && save.disabled || !draft || saving || draft.saved) return;
           const target = draft;
           const payload = noteInput(target, titleInput.value, notebooks.value);
           saving = true;
           sync();
-          status("正在保存笔记…");
+          status("正在检查重复收藏…");
           try {
+            if (!forceCopy) {
+              const existing = await findExisting(context, target.url);
+              if (!mounted) return;
+              if (existing) {
+                target.existingId = existing.id;
+                status("已收藏过这个网址。可以打开已有收藏，或选择仍保存新副本。");
+                return;
+              }
+            }
+            status("正在保存笔记…");
             const note = await context.notes.create(payload);
             target.saved = true;
             target.savedId = note?.id || null;
+            target.savedPayload = payload;
             status("已保存到所选笔记本。");
             context.ui.showNotice("已收藏：" + payload.title);
           } catch {
@@ -5729,6 +5879,7 @@ var main_default = {
             saving = false;
             sync();
           }
+          if (mounted && target.savedId && target.images && localImages.checked) await finishImages(target);
         }
         sync();
         void loadNotebooks();
@@ -5736,6 +5887,7 @@ var main_default = {
           mounted = false;
           requestId++;
           controller?.abort();
+          imageController?.abort();
           cleanupPanels.delete(cleanup);
           root2.remove();
         };

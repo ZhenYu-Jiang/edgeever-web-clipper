@@ -2,7 +2,7 @@
   "type": "plugin",
   "id": "com.example.web-clipper",
   "name": "Web Clipper",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "apiVersion": "2",
   "settingsUi": "host",
   "description": "Extract article content, preview it, and save formatted notes from webpages or RSS feeds.",
@@ -14,6 +14,19 @@
   },
   "author": "ZhenYu-Jiang",
   "entry": "./main.js",
-  "platforms": ["web", "desktop"],
-  "permissions": ["network:public", "notes:write", "metadata:read", "ui:commands", "ui:panels", "ui:notices", "ui:navigation"]
+  "platforms": [
+    "web",
+    "desktop"
+  ],
+  "permissions": [
+    "network:public",
+    "notes:write",
+    "metadata:read",
+    "ui:commands",
+    "ui:panels",
+    "ui:notices",
+    "ui:navigation",
+    "notes:read",
+    "resources:write"
+  ]
 }
